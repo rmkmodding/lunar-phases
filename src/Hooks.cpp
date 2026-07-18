@@ -26,29 +26,23 @@ static void*                                        s_hookTargetByRequest   = nu
 static const RED4ext::v1::Sdk*                      s_sdk                   = nullptr;
 static RED4ext::v1::PluginHandle                    s_handle;
 
-// All distinct moon ResourceTokens the game is currently holding.  The game can
-// hand the sky renderer a fresh ResourceToken on scene transitions (main menu →
-// gameplay, or loading a new save) while older tokens may briefly remain the ones
-// actively rendered.  To guarantee the live moon updates, SwapMoonTexture()
-// rewrites the resource on EVERY tracked token rather than guessing which one the
-// renderer reads.
-//
-// We hold each token by SharedPtr (a strong reference), so a tracked token can
-// never dangle.  When a token's strong-ref count drops to 1 it means WE are the
-// only remaining holder — the game has released it and it can never be rendered
-// again — so it is reaped.  This keeps the set bounded to just the tokens the game
-// still references (normally one, occasionally a couple during a transition),
-// deterministically and regardless of how many saves the user loads.
+// All distinct moon ResourceTokens the game currently holds.  SwapMoonTexture()
+// rewrites every tracked token so the live one (which may change on scene
+// transitions) always reflects the current phase.  Tokens with use count <= 1
+// are reaped - only we hold them; the game has released them.
 static std::vector<RED4ext::SharedPtr<RED4ext::ResourceToken<>>> g_moonTokens;
 static std::mutex                                                g_moonTokensMutex;
 
-// Canonical CResource handle for each phase, captured lazily on first swap.
-// Stored separately from g_phaseTokens so that writing to a moon token's resource
-// (which may alias g_phaseTokens[prev_phase]) never corrupts the source handles.
+// Gated to Running state: registering OnLoaded callbacks during the pre-Running
+// startup burst (~12 k loads) would flood the job queue and trigger a deadlock assertion.
+static std::atomic<bool>    s_runningActive{false};
+static std::atomic<int32_t> s_preRunningLoadCount{0}; // resets each Running enter
+
+// Canonical CResource handle for each phase; captured before any swap to prevent
+// premature ref-count drops when a moon token aliases g_phaseTokens[i].
 static RED4ext::Handle<RED4ext::CResource> g_phaseResources[kPhaseCount];
 
-// Drop tokens that only WE still reference (use count <= 1): the game has released
-// them, so they are no longer rendered.  Caller must hold g_moonTokensMutex.
+// Remove tokens the game has released (use count <= 1; caller must hold g_moonTokensMutex).
 static void ReapDeadMoonTokensLocked()
 {
     std::erase_if(g_moonTokens,
@@ -93,10 +87,12 @@ static uintptr_t Hook_IssueLoadingRequest(
 
     auto result = s_originalLoadByRequest(aThis, aOut, aRequest);
 
-    // Probe every returned token for an AtmosphereAreaSettings to support
-    // runtime luminosity scaling.  Already-loaded resources are checked
-    // synchronously; pending ones use OnLoaded to check asynchronously.
-    if (aOut.instance)
+    const bool running = s_runningActive.load(std::memory_order_relaxed);
+    if (!running)
+        s_preRunningLoadCount.fetch_add(1, std::memory_order_relaxed);
+
+    // Probe for AtmosphereAreaSettings; gated to Running state (see s_runningActive).
+    if (aOut.instance && running)
     {
         if (aOut.instance->IsLoaded())
         {
@@ -162,9 +158,8 @@ void ResetMoonToken()
         std::lock_guard<std::mutex> guard(g_moonTokensMutex);
         g_moonTokens.clear();
     }
-    // g_phaseResources is intentionally kept: the canonical texture handles
-    // remain valid across session transitions as long as the tokens are alive.
-    if (s_sdk) s_sdk->logger->Info(s_handle, "[Hook] Moon tokens reset — will re-capture on next load.");
+    // g_phaseResources is kept across sessions; the handles remain valid as long as tokens are alive.
+    if (s_sdk) s_sdk->logger->Info(s_handle, "[Hook] Moon tokens reset - will re-capture on next load.");
 }
 
 bool IsMoonTokenCaptured()
@@ -173,12 +168,48 @@ bool IsMoonTokenCaptured()
     return !g_moonTokens.empty();
 }
 
+void SetRunningState(bool aRunning)
+{
+    s_runningActive.store(aRunning, std::memory_order_relaxed);
+    if (!s_sdk) return;
+    if (aRunning)
+    {
+        const int32_t count = s_preRunningLoadCount.exchange(0, std::memory_order_relaxed);
+        s_sdk->logger->InfoF(s_handle, "[Hook] Running active (%d pre-Running loads).", count);
+    }
+    else
+    {
+        s_sdk->logger->Info(s_handle, "[Hook] Shutdown.");
+    }
+}
+
 void SwapMoonTexture(int32_t phase)
 {
-    // Capture the canonical CResource handle for this phase once, from the phase's
-    // own preloaded token, before any swap.  g_phaseResources is never mutated
-    // through a moon token, so it stays a clean source even though moon tokens may
-    // alias g_phaseTokens entries via the ResourceLoader cache.
+    // Eagerly capture g_phaseResources for every phase that is already loaded,
+    // before any swap loop overwrites a moon token's resource field.
+    //
+    // Root cause guarded against: the ResourceLoader cache may return the exact same
+    // ResourceToken object for both g_phaseTokens[i] and the captured moon token
+    // (they share one token instance because the hook redirected moon.xbm to
+    // moon_phase_i.xbm and the loader hit its cache).  Overwriting that token's
+    // resource field inside the swap loop therefore also changes
+    // g_phaseTokens[i]->resource - dropping the Handle<CResource> ref count for the
+    // original phase-i texture to zero and freeing it while ArchiveXL (or the sky
+    // renderer) may still hold a raw pointer to it, leading to a dangling-pointer
+    // ACCESS_VIOLATION crash (typically surfacing ~30 min later when a GC pass or
+    // scene transition walks the freed address).
+    //
+    // Reading g_phaseTokens[i]->resource NOW, before any swap, captures the
+    // correct original CResource into g_phaseResources[i].  Subsequent swaps that
+    // overwrite the token's resource field no longer drop the ref count to zero
+    // because g_phaseResources[i] always holds one strong reference.
+    for (int32_t i = 0; i < kPhaseCount; ++i)
+    {
+        if (!g_phaseResources[i].instance && g_phaseTokens[i].instance && g_phaseTokens[i].instance->IsLoaded())
+            g_phaseResources[i] = g_phaseTokens[i].instance->resource;
+    }
+
+    // Fallback: phase texture was not yet loaded when the capture loop ran.
     if (!g_phaseResources[phase].instance)
     {
         auto& tok = g_phaseTokens[phase];
@@ -197,10 +228,7 @@ void SwapMoonTexture(int32_t phase)
         g_phaseResources[phase] = tok.instance->resource;
     }
 
-    // Rewrite the resource handle on EVERY tracked moon token.  The sky renderer
-    // reads token->resource to get the CBitmapTexture*; whichever token it holds,
-    // it now points at the requested phase.  Skipping tokens that already match
-    // avoids needless churn.
+    // Rewrite every tracked moon token's resource to the requested phase.
     size_t swapped = 0;
     size_t tracked = 0;
     {
@@ -211,6 +239,7 @@ void SwapMoonTexture(int32_t phase)
             if (s_sdk) s_sdk->logger->Warn(s_handle, "[Swap] No moon token captured yet.");
             return;
         }
+
         for (auto& token : g_moonTokens)
         {
             std::lock_guard<RED4ext::SharedSpinLock> tokGuard(token.instance->lock);

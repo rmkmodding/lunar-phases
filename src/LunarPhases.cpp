@@ -39,6 +39,17 @@ void PreloadPhaseTextures()
     }
 }
 
+void PreloadPhaseTexture(int32_t phase)
+{
+    if (phase < 0 || phase >= kPhaseCount)
+        return;
+    auto* loader = RED4ext::ResourceLoader::Get();
+    if (!loader)
+        return;
+    if (!g_phaseTokens[phase].instance)
+        g_phaseTokens[phase] = loader->LoadAsync(RED4ext::ResourcePath(kPhasePaths[phase]));
+}
+
 void ReleasePhaseTextures()
 {
     for (int32_t i = 0; i < kPhaseCount; ++i)

@@ -54,8 +54,13 @@ extern RED4ext::SharedPtr<RED4ext::ResourceToken<>> g_phaseTokens[kPhaseCount];
 
 // ─── Lifetime ────────────────────────────────────────────────────────────────
 
-/// Pre-load all phase textures via ResourceLoader.  Call from Running OnEnter.
+/// Pre-load all phase textures via ResourceLoader.  Submits all 16 loads at once;
+/// prefer PreloadPhaseTexture() + staggering to avoid job-queue flooding on startup.
 void PreloadPhaseTextures();
+
+/// Pre-load a single phase texture asynchronously.  Safe to call repeatedly;
+/// returns immediately if the token is already held.
+void PreloadPhaseTexture(int32_t phase);
 
 /// Release all cached phase tokens.  Call on plugin Unload.
 void ReleasePhaseTextures();

@@ -18,7 +18,7 @@
 namespace LunarPhases::LuminosityPatch
 {
 
-/// One discovered LightAreaSettings — controls the moon as a directional light source.
+/// One discovered LightAreaSettings - controls the moon as a directional light source.
 /// Scaling its moonColor dims both the moon light and the shadows it casts.
 struct LightEntry
 {
@@ -35,7 +35,7 @@ static RED4ext::v1::PluginHandle s_handle;
 static std::mutex                s_mutex;
 static std::vector<AtmosphereEntry> s_entries;
 
-// Cached RTTI class pointers — populated lazily inside the mutex.
+// Cached RTTI class pointers - populated lazily inside the mutex.
 static RED4ext::CClass* s_envParamClass      = nullptr; // worldEnvironmentAreaParameters
 static RED4ext::CClass* s_envDefinitionClass = nullptr; // worldEnvironmentDefinition
 static RED4ext::CClass* s_sectorClass        = nullptr; // worldStreamingSector
@@ -131,7 +131,7 @@ static void ScanAreaSettingsLocked(
 
         auto* atmo = static_cast<RED4ext::AtmosphereAreaSettings*>(areaSettings);
 
-        // Skip duplicates — same AtmosphereAreaSettings* may come from both resource types.
+        // Skip duplicates - same AtmosphereAreaSettings* may come from both resource types.
         bool duplicate = false;
         for (const auto& existing : s_entries)
         {

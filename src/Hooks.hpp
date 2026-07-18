@@ -25,4 +25,11 @@ void ResetMoonToken();
 /// Returns true once the hook has captured a valid moon ResourceToken.
 bool IsMoonTokenCaptured();
 
+/// Enable or disable luminosity-patch OnLoaded callback registration inside the hook.
+/// Must be called with aRunning=true in OnRunningEnter and false in OnShutdownEnter.
+/// Before Running is active, the hook skips OnLoaded registration and synchronous
+/// TryRegisterToken calls entirely: engine-init resources are never atmosphere types,
+/// and registering callbacks on them floods the job queue during the startup burst.
+void SetRunningState(bool aRunning);
+
 } // namespace LunarPhases
