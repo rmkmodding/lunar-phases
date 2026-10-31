@@ -60,6 +60,7 @@ struct HDRCurveBaseline
 struct AtmosphereEntry
 {
     RED4ext::SharedPtr<RED4ext::ResourceToken<>> token;   ///< keeps resource alive
+    RED4ext::Handle<RED4ext::IAreaSettings>      keepAlive; ///< keeps settings alive if the owner drops them
     RED4ext::AtmosphereAreaSettings*             settings = nullptr;
     FloatCurveBaseline                           baseMoonGlowIntensity;
     HDRCurveBaseline                             baseMoonColor;

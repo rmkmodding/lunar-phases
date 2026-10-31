@@ -1,4 +1,8 @@
 #include <mutex>
+#include <optional>
+#include <unordered_set>
+
+#include <Windows.h>
 
 #include <RED4ext/RED4ext.hpp>
 #include <RED4ext/RTTISystem.hpp>
@@ -23,8 +27,23 @@ namespace LunarPhases::LuminosityPatch
 struct LightEntry
 {
     RED4ext::SharedPtr<RED4ext::ResourceToken<>> token;
+    RED4ext::Handle<RED4ext::IAreaSettings>      keepAlive; // keeps settings alive if the owner drops them
     RED4ext::LightAreaSettings*                  settings = nullptr;
     HDRCurveBaseline                             baseMoonColor;
+};
+
+/// The values the registered curves currently hold.  New entries are scaled as they register,
+/// so this stays accurate for them too.
+struct AppliedValues
+{
+    float moonScale;
+    float starScale;
+    float lightScale;
+    float tintR;
+    float tintG;
+    float tintB;
+
+    bool operator==(const AppliedValues&) const = default;
 };
 
 // ─── Module state ─────────────────────────────────────────────────────────────
@@ -44,12 +63,53 @@ static RED4ext::CClass* s_envNotifierClass   = nullptr; // worldEnvAreaNotifier
 static RED4ext::CClass*  s_atmosphereClass   = nullptr; // AtmosphereAreaSettings
 static RED4ext::CClass*  s_lightClass        = nullptr; // LightAreaSettings
 static std::vector<LightEntry> s_lightEntries;
+// Serial IDs (ISerializable::unk28, never reused) of sectors already walked.
+static std::unordered_set<uint64_t> s_scannedSectors;
 static RED4ext::HDRColor s_colorTint{1.0f, 1.0f, 1.0f, 1.0f}; // per-channel tint multiplier
 static bool              s_starDimming       = true;          // scale stars inversely to moon
 static bool              s_moonLightScaling  = true;          // scale directional light + shadows with phase
 static float             s_starBrightness    = 1.0f;          // manual multiplier on top of auto-dimming
+static std::optional<AppliedValues> s_lastApplied;            // empty until the first ApplyPhase
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// True if aAddress is inside a section of the game executable that is code (aExecutable)
+/// or data (!aExecutable).
+static bool IsInGameSection(uintptr_t aAddress, bool aExecutable)
+{
+    const auto  base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto* dos  = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt   = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const auto* sec  = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec)
+    {
+        const uintptr_t start = base + sec->VirtualAddress;
+        if (aAddress >= start && aAddress < start + sec->Misc.VirtualSize)
+            return ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0) == aExecutable;
+    }
+    return false;
+}
+
+/// GetType() for objects owned by a loaded sector, or nullptr if the object is not intact.
+/// Sector objects have been seen with a non-vtable first qword while their sector is still
+/// alive (a freed or reused block), and calling through it crashes the resource thread.
+/// The range checks catch that without faulting; SEH covers memory changing under the checks.
+static RED4ext::CClass* SafeGetType(RED4ext::ISerializable* aObject)
+{
+    __try
+    {
+        const auto* vtable = *reinterpret_cast<const uintptr_t* const*>(aObject);
+        if (!IsInGameSection(reinterpret_cast<uintptr_t>(vtable), false))
+            return nullptr;
+        if (!IsInGameSection(vtable[1], true)) // slot 08: GetType
+            return nullptr;
+        return aObject->GetType();
+    }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    {
+        return nullptr;
+    }
+}
 
 /// Save all keyframes from a CurveData<float> into a FloatCurveBaseline.
 static FloatCurveBaseline SaveFloatCurve(RED4ext::CurveData<float>& aCurve)
@@ -127,7 +187,8 @@ static void ScanAreaSettingsLocked(
     {
         auto* areaSettings = params[i].instance;
         if (!areaSettings) continue;
-        if (areaSettings->GetType() != aAtmosphereClass) continue;
+        auto* settingsType = SafeGetType(areaSettings);
+        if (!settingsType || settingsType != aAtmosphereClass) continue;
 
         auto* atmo = static_cast<RED4ext::AtmosphereAreaSettings*>(areaSettings);
 
@@ -141,6 +202,7 @@ static void ScanAreaSettingsLocked(
 
         AtmosphereEntry entry;
         entry.token    = aToken;
+        entry.keepAlive = params[i];
         entry.settings = atmo;
         entry.baseMoonGlowIntensity = SaveFloatCurve(atmo->moonGlowIntensity);
         entry.baseMoonColor         = SaveHDRCurve(atmo->moonColor);
@@ -179,7 +241,7 @@ static void ScanAreaSettingsLocked(
         {
             auto* areaSettings = params[i].instance;
             if (!areaSettings) continue;
-            if (areaSettings->GetType() != aLightClass) continue;
+            if (SafeGetType(areaSettings) != aLightClass) continue;
 
             auto* light = static_cast<RED4ext::LightAreaSettings*>(areaSettings);
 
@@ -190,6 +252,7 @@ static void ScanAreaSettingsLocked(
 
             LightEntry le;
             le.token         = aToken;
+            le.keepAlive     = params[i];
             le.settings      = light;
             le.baseMoonColor = SaveHDRCurve(light->moonColor);
 
@@ -270,6 +333,10 @@ void TryRegisterToken(RED4ext::SharedPtr<RED4ext::ResourceToken<>> aToken)
     }
     else if (type == s_sectorClass)
     {
+        // Cached sectors come back through the hook on every request; only walk each one once.
+        if (!s_scannedSectors.insert(resource->unk28).second)
+            return;
+
         // worldStreamingSector nodes are accessed via worldCompiledSector at
         // offset 0x40 (Codeware: worldStreamingSector::compiled).
         // nodes: DynArray<Handle<worldNode>> sits at +0x30 within it (+0x28 before patch 2.5).
@@ -277,23 +344,33 @@ void TryRegisterToken(RED4ext::SharedPtr<RED4ext::ResourceToken<>> aToken)
         auto* nodeArray = reinterpret_cast<NodeArrayT*>(
             reinterpret_cast<uint8_t*>(resource) + 0x40 + 0x30);
 
+        uint32_t invalidObjects = 0;
         for (uint32_t i = 0; i < nodeArray->Size(); ++i)
         {
             auto* node = (*nodeArray)[i].instance;
             if (!node) continue;
-            if (node->GetType() != s_triggerNodeClass) continue;
+            auto* nodeType = SafeGetType(node);
+            if (!nodeType) { ++invalidObjects; continue; }
+            if (nodeType != s_triggerNodeClass) continue;
 
             auto* trigger = static_cast<RED4ext::world::TriggerAreaNode*>(node);
             for (uint32_t j = 0; j < trigger->notifiers.Size(); ++j)
             {
                 auto* notifier = trigger->notifiers[j].instance;
                 if (!notifier) continue;
-                if (static_cast<RED4ext::IScriptable*>(notifier)->GetType() != s_envNotifierClass)
-                    continue;
+                auto* notifierType = SafeGetType(static_cast<RED4ext::IScriptable*>(notifier));
+                if (!notifierType) { ++invalidObjects; continue; }
+                if (notifierType != s_envNotifierClass) continue;
 
                 auto* envNotifier = static_cast<RED4ext::world::EnvAreaNotifier*>(notifier);
                 ScanAreaSettingsLocked(aToken, envNotifier->params, s_atmosphereClass, s_lightClass, "sector");
             }
+        }
+
+        if (s_sdk && invalidObjects > 0)
+        {
+            s_sdk->logger->WarnF(s_handle,
+                "[Lum] Skipped %u invalid objects in sector 0x%p.", invalidObjects, static_cast<void*>(resource));
         }
     }
 }
@@ -303,12 +380,23 @@ void ApplyPhase(int32_t aPhase)
     if (aPhase < 0) aPhase = 0;
     if (aPhase >= kPhaseCount) aPhase = kPhaseCount - 1;
 
+    std::lock_guard<std::mutex> lock(s_mutex);
+
     const float scale         = kPhaseLuminosityScale[aPhase];
     const float autoStarScale = s_starDimming ? 1.0f - scale * 0.8f : 1.0f;
     const float starScale     = autoStarScale * s_starBrightness;
     const float lightScale    = s_moonLightScaling ? scale : 1.0f;
 
-    std::lock_guard<std::mutex> lock(s_mutex);
+    // Callers run up to once per frame during a time skip, so only touch the curves on a change.
+    const AppliedValues values{scale, starScale, lightScale, s_colorTint.Red, s_colorTint.Green, s_colorTint.Blue};
+    if (s_lastApplied == values)
+        return;
+
+    // The moon tint changes constantly as game time moves, so it does not get a log line.
+    const bool brightnessChanged = !s_lastApplied || s_lastApplied->moonScale != scale ||
+                                   s_lastApplied->starScale != starScale || s_lastApplied->lightScale != lightScale;
+    s_lastApplied = values;
+
     for (auto& entry : s_entries)
     {
         if (!entry.settings) continue;
@@ -328,7 +416,7 @@ void ApplyPhase(int32_t aPhase)
             ApplyHDRCurve(le.settings->moonColor, le.baseMoonColor, lightScale);
     }
 
-    if (s_sdk && (!s_entries.empty() || !s_lightEntries.empty()))
+    if (s_sdk && brightnessChanged && (!s_entries.empty() || !s_lightEntries.empty()))
     {
         s_sdk->logger->InfoF(s_handle,
             "[Lum] Phase %d applied (scale=%.2f, star=%.2f, light=%.2f) to %zu atmo + %zu light entries.",
@@ -376,6 +464,7 @@ void ReleaseAll()
 {
     std::lock_guard<std::mutex> lock(s_mutex);
     s_entries.clear();
+    s_scannedSectors.clear();
     s_envParamClass      = nullptr;
     s_envDefinitionClass = nullptr;
     s_sectorClass        = nullptr;
@@ -388,6 +477,7 @@ void ReleaseAll()
     s_starDimming        = false;
     s_moonLightScaling   = true;
     s_starBrightness     = 1.0f;
+    s_lastApplied.reset();
 }
 
 } // namespace LunarPhases::LuminosityPatch
