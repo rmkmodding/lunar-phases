@@ -270,12 +270,12 @@ void TryRegisterToken(RED4ext::SharedPtr<RED4ext::ResourceToken<>> aToken)
     }
     else if (type == s_sectorClass)
     {
-        // worldStreamingSector nodes are accessed via StreamingSectorNodeBuffer at
-        // offset 0x40 (Codeware: Raw::StreamingSector::NodeBuffer).
-        // nodes: DynArray<Handle<worldNode>> sits at +0x28 within that buffer.
+        // worldStreamingSector nodes are accessed via worldCompiledSector at
+        // offset 0x40 (Codeware: worldStreamingSector::compiled).
+        // nodes: DynArray<Handle<worldNode>> sits at +0x30 within it (+0x28 before patch 2.5).
         using NodeArrayT = RED4ext::DynArray<RED4ext::Handle<RED4ext::world::Node>>;
         auto* nodeArray = reinterpret_cast<NodeArrayT*>(
-            reinterpret_cast<uint8_t*>(resource) + 0x40 + 0x28);
+            reinterpret_cast<uint8_t*>(resource) + 0x40 + 0x30);
 
         for (uint32_t i = 0; i < nodeArray->Size(); ++i)
         {

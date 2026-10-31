@@ -1,0 +1,65 @@
+name: Release
+
+# Publishes a GitHub Release when a version tag (e.g. v1.0.0) is pushed,
+# or on demand for a tag that already exists.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release (e.g. v1.0.2)
+        required: true
+
+# Required for softprops/action-gh-release to create the release.
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          submodules: recursive
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Release x64)
+        run: MSBuild.exe lunar-phases.sln -v:minimal -m -property:Configuration=Release -property:Platform=x64
+
+      - name: Stage plugin packages
+        shell: pwsh
+        run: |
+          $plugin  = "LunarPhases"
+          $version = $env:RELEASE_TAG
+
+          # Main package: DLL, laid out to extract into the game root.
+          $mainDest = "package/red4ext/plugins/$plugin"
+          New-Item -ItemType Directory -Force -Path $mainDest | Out-Null
+          Copy-Item "build/release/bin/$plugin.dll" $mainDest
+          Compress-Archive -Path "package/*" -DestinationPath "$plugin-$version.zip" -Force
+
+          # Debug symbols package: PDB only, same layout so it drops in beside the DLL.
+          $pdbDest = "package-pdb/red4ext/plugins/$plugin"
+          New-Item -ItemType Directory -Force -Path $pdbDest | Out-Null
+          Copy-Item "build/release/bin/$plugin.pdb" $pdbDest
+          Compress-Archive -Path "package-pdb/*" -DestinationPath "${plugin}-${version}_pdb.zip" -Force
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          files: |
+            LunarPhases-${{ env.RELEASE_TAG }}.zip
+            LunarPhases-${{ env.RELEASE_TAG }}_pdb.zip

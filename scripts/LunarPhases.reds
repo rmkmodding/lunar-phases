@@ -1,5 +1,5 @@
 // Native class implemented in LunarPhases.dll (registered in LunarPhases::RegisterTypes / PostRegisterTypes).
-// This file must be deployed at:  red4ext/plugins/LunarPhases/scripts/LunarPhases.reds
+// This file ships in r6/scripts with the rest of the mod's scripts
 
 public native class LunarPhases extends IScriptable {
     // Set the active moon phase (0 = new moon … 15 = waning crescent).
