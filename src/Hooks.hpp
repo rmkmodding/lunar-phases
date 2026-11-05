@@ -11,6 +11,8 @@ namespace LunarPhases
 void AttachHooks(const RED4ext::v1::Sdk* aSdk, RED4ext::v1::PluginHandle aHandle);
 
 /// Remove the ResourceLoader path-redirect hook.  Call during plugin Unload.
+/// Any engine references still held are leaked rather than released, because the
+/// engine has already been torn down by the time plugins unload.
 void DetachHooks(const RED4ext::v1::Sdk* aSdk, RED4ext::v1::PluginHandle aHandle);
 
 /// Replace the resource inside the cached moon token with the texture for the
@@ -18,9 +20,9 @@ void DetachHooks(const RED4ext::v1::Sdk* aSdk, RED4ext::v1::PluginHandle aHandle
 /// initial moon load has been captured by the hook.
 void SwapMoonTexture(int32_t phase);
 
-/// Discard the captured moon token and saved phase-0 resource so the hook
-/// re-acquires a fresh token on the next session load.
-void ResetMoonToken();
+/// Release the captured moon tokens and the saved phase resources.  Call in
+/// Shutdown OnEnter, while the engine systems that own these resources still exist.
+void ReleaseMoonResources();
 
 /// Returns true once the hook has captured a valid moon ResourceToken.
 bool IsMoonTokenCaptured();

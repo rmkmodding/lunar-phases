@@ -10,12 +10,16 @@ static bool    s_pendingTextureApply = false;
 // Stagger cursor for spreading phase-texture preloads across frames (avoids job-queue flooding).
 static int32_t s_preloadCursor       = 0;
 
-// Shutdown OnEnter: the current game session is ending.  Reset the moon token so the
-// hook is forced to re-capture a fresh one when the next session's sky loads.
+// Shutdown OnEnter: the game is exiting.  Release every engine reference we hold now,
+// while the engine systems are still alive.  Plugin Unload runs after the engine is torn
+// down, and dropping the last reference to a streaming sector there runs its physics
+// collider destructors against a destroyed physics system.
 static bool OnShutdownEnter(RED4ext::CGameApplication*)
 {
     LunarPhases::SetRunningState(false);
-    LunarPhases::ResetMoonToken();
+    LunarPhases::ReleaseMoonResources();
+    LunarPhases::ReleasePhaseTextures();
+    LunarPhases::LuminosityPatch::ReleaseAll();
     return true;
 }
 
@@ -73,7 +77,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         rtti->AddRegisterCallback(&LunarPhases::RegisterTypes);
         rtti->AddPostRegisterCallback(&LunarPhases::PostRegisterTypes);
 
-        // Shutdown: reset moon token so the hook re-captures cleanly for the next session.
+        // Shutdown: release engine references before the engine tears itself down.
         RED4ext::v1::GameState shutdownState{&OnShutdownEnter, nullptr, nullptr};
         aSdk->gameStates->Add(aHandle, RED4ext::EGameStateType::Shutdown, &shutdownState);
 
@@ -86,9 +90,10 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
     }
     case RED4ext::v1::EMainReason::Unload:
     {
-        LunarPhases::ReleasePhaseTextures();
+        // The engine is gone by now; leak anything still held rather than destroy it.
         LunarPhases::DetachHooks(aSdk, aHandle);
-        LunarPhases::LuminosityPatch::ReleaseAll();
+        LunarPhases::AbandonPhaseTextures();
+        LunarPhases::LuminosityPatch::AbandonAll();
 
         aSdk->logger->Info(aHandle, "LunarPhases plugin unloaded.");
         break;

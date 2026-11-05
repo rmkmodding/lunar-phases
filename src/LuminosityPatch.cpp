@@ -480,4 +480,13 @@ void ReleaseAll()
     s_lastApplied.reset();
 }
 
+void AbandonAll()
+{
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (!s_entries.empty())
+        new std::vector<AtmosphereEntry>(std::move(s_entries));
+    if (!s_lightEntries.empty())
+        new std::vector<LightEntry>(std::move(s_lightEntries));
+}
+
 } // namespace LunarPhases::LuminosityPatch

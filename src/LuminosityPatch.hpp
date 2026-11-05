@@ -108,8 +108,13 @@ void SetMoonLightScaling(bool enabled);
 /// Thread-safe; re-applies immediately.
 void SetStarBrightness(float multiplier);
 
-/// Release all stored entries.  Call on plugin Unload.
+/// Release all stored entries.  Call in Shutdown OnEnter, while the engine is still alive.
+/// The entries hold streaming-sector tokens, and destroying a sector tears down its
+/// physics colliders, which crashes once the physics system is gone.
 void ReleaseAll();
+
+/// Leak any entries still held instead of releasing them.  Call on plugin Unload.
+void AbandonAll();
 
 } // namespace LuminosityPatch
 

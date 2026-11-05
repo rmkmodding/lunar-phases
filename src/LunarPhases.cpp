@@ -58,6 +58,15 @@ void ReleasePhaseTextures()
     }
 }
 
+void AbandonPhaseTextures()
+{
+    for (int32_t i = 0; i < kPhaseCount; ++i)
+    {
+        if (g_phaseTokens[i].instance)
+            new RED4ext::SharedPtr<RED4ext::ResourceToken<>>(std::move(g_phaseTokens[i]));
+    }
+}
+
 // ─── Native class ────────────────────────────────────────────────────────────
 
 struct LunarPhasesNative : RED4ext::IScriptable

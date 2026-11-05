@@ -103,7 +103,10 @@ static uintptr_t Hook_IssueLoadingRequest(
             aOut.instance->OnLoaded(
                 [token = aOut](RED4ext::Handle<RED4ext::CResource>&)
                 {
-                    LuminosityPatch::TryRegisterToken(token);
+                    // A load that finishes after Shutdown must not re-acquire references
+                    // that OnShutdownEnter already released.
+                    if (s_runningActive.load(std::memory_order_relaxed))
+                        LuminosityPatch::TryRegisterToken(token);
                 });
         }
     }
@@ -145,21 +148,29 @@ void DetachHooks(const RED4ext::v1::Sdk* aSdk, RED4ext::v1::PluginHandle aHandle
         s_originalLoadByRequest = nullptr;
     }
 
+    // Everything should already have been released in ReleaseMoonResources() at Shutdown.
+    // Anything left was acquired later.  The engine is torn down by now, so dropping the
+    // last reference would run resource destructors against freed systems; leak it instead.
     {
         std::lock_guard<std::mutex> guard(g_moonTokensMutex);
-        g_moonTokens.clear();
+        if (!g_moonTokens.empty())
+            new std::vector<RED4ext::SharedPtr<RED4ext::ResourceToken<>>>(std::move(g_moonTokens));
     }
-    for (auto& r : g_phaseResources) r.Reset();
+    for (auto& r : g_phaseResources)
+    {
+        if (r.instance)
+            new RED4ext::Handle<RED4ext::CResource>(std::move(r));
+    }
 }
 
-void ResetMoonToken()
+void ReleaseMoonResources()
 {
     {
         std::lock_guard<std::mutex> guard(g_moonTokensMutex);
         g_moonTokens.clear();
     }
-    // g_phaseResources is kept across sessions; the handles remain valid as long as tokens are alive.
-    if (s_sdk) s_sdk->logger->Info(s_handle, "[Hook] Moon tokens reset - will re-capture on next load.");
+    for (auto& r : g_phaseResources) r.Reset();
+    if (s_sdk) s_sdk->logger->Info(s_handle, "[Hook] Moon tokens and phase resources released.");
 }
 
 bool IsMoonTokenCaptured()

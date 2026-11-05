@@ -62,8 +62,12 @@ void PreloadPhaseTextures();
 /// returns immediately if the token is already held.
 void PreloadPhaseTexture(int32_t phase);
 
-/// Release all cached phase tokens.  Call on plugin Unload.
+/// Release all cached phase tokens.  Call in Shutdown OnEnter, while the engine is still alive.
 void ReleasePhaseTextures();
+
+/// Leak any phase tokens still held instead of releasing them.  Call on plugin Unload,
+/// when the engine is already torn down and running resource destructors is unsafe.
+void AbandonPhaseTextures();
 
 /// Store the SDK pointer and handle for logging.  Call before RegisterTypes.
 void Init(const RED4ext::v1::Sdk* aSdk, RED4ext::v1::PluginHandle aHandle);
