@@ -59,9 +59,10 @@ struct HDRCurveBaseline
 /// One discovered AtmosphereAreaSettings, extracted from any loaded environment resource.
 struct AtmosphereEntry
 {
-    RED4ext::SharedPtr<RED4ext::ResourceToken<>> token;   ///< keeps resource alive
-    RED4ext::Handle<RED4ext::IAreaSettings>      keepAlive; ///< keeps settings alive if the owner drops them
-    RED4ext::AtmosphereAreaSettings*             settings = nullptr;
+    /// Weak, so the game can unload the owning resource.  Lock() before touching settings;
+    /// the entry is dropped once the settings object dies.
+    RED4ext::WeakHandle<RED4ext::IAreaSettings> handle;
+    RED4ext::AtmosphereAreaSettings*            settings = nullptr; ///< valid only while handle is locked
     FloatCurveBaseline                           baseMoonGlowIntensity;
     HDRCurveBaseline                             baseMoonColor;
     FloatCurveBaseline                           baseGalaxyIntensity;
@@ -109,8 +110,6 @@ void SetMoonLightScaling(bool enabled);
 void SetStarBrightness(float multiplier);
 
 /// Release all stored entries.  Call in Shutdown OnEnter, while the engine is still alive.
-/// The entries hold streaming-sector tokens, and destroying a sector tears down its
-/// physics colliders, which crashes once the physics system is gone.
 void ReleaseAll();
 
 /// Leak any entries still held instead of releasing them.  Call on plugin Unload.

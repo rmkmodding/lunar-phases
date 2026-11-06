@@ -26,10 +26,9 @@ namespace LunarPhases::LuminosityPatch
 /// Scaling its moonColor dims both the moon light and the shadows it casts.
 struct LightEntry
 {
-    RED4ext::SharedPtr<RED4ext::ResourceToken<>> token;
-    RED4ext::Handle<RED4ext::IAreaSettings>      keepAlive; // keeps settings alive if the owner drops them
-    RED4ext::LightAreaSettings*                  settings = nullptr;
-    HDRCurveBaseline                             baseMoonColor;
+    RED4ext::WeakHandle<RED4ext::IAreaSettings> handle;            // weak, see AtmosphereEntry
+    RED4ext::LightAreaSettings*                 settings = nullptr; // valid only while handle is locked
+    HDRCurveBaseline                            baseMoonColor;
 };
 
 /// The values the registered curves currently hold.  New entries are scaled as they register,
@@ -63,8 +62,9 @@ static RED4ext::CClass* s_envNotifierClass   = nullptr; // worldEnvAreaNotifier
 static RED4ext::CClass*  s_atmosphereClass   = nullptr; // AtmosphereAreaSettings
 static RED4ext::CClass*  s_lightClass        = nullptr; // LightAreaSettings
 static std::vector<LightEntry> s_lightEntries;
-// Serial IDs (ISerializable::unk28, never reused) of sectors already walked.
-static std::unordered_set<uint64_t> s_scannedSectors;
+// Serial IDs (ISerializable::unk28, never reused) of resources already scanned.  A resource
+// that unloads and loads again gets a new ID, so it is scanned again.
+static std::unordered_set<uint64_t> s_scannedResources;
 static RED4ext::HDRColor s_colorTint{1.0f, 1.0f, 1.0f, 1.0f}; // per-channel tint multiplier
 static bool              s_starDimming       = true;          // scale stars inversely to moon
 static bool              s_moonLightScaling  = true;          // scale directional light + shadows with phase
@@ -172,10 +172,17 @@ static void ApplyHDRCurve(RED4ext::CurveData<RED4ext::HDRColor>& aCurve,
     }
 }
 
+/// Drop entries whose settings object has been destroyed (its resource unloaded).
+/// Caller must hold s_mutex.
+static void ReapDeadEntriesLocked()
+{
+    std::erase_if(s_entries, [](const AtmosphereEntry& e) { return e.handle.Expired(); });
+    std::erase_if(s_lightEntries, [](const LightEntry& e) { return e.handle.Expired(); });
+}
+
 /// Scan one WorldRenderAreaSettings array and register any AtmosphereAreaSettings found.
 /// Caller must hold s_mutex.
 static void ScanAreaSettingsLocked(
-    RED4ext::SharedPtr<RED4ext::ResourceToken<>>  aToken,
     RED4ext::WorldRenderAreaSettings&             aSettings,
     RED4ext::CClass*                              aAtmosphereClass,
     RED4ext::CClass*                              aLightClass,
@@ -193,16 +200,16 @@ static void ScanAreaSettingsLocked(
         auto* atmo = static_cast<RED4ext::AtmosphereAreaSettings*>(areaSettings);
 
         // Skip duplicates - same AtmosphereAreaSettings* may come from both resource types.
+        // An expired entry's address may have been reused, so it does not count.
         bool duplicate = false;
         for (const auto& existing : s_entries)
         {
-            if (existing.settings == atmo) { duplicate = true; break; }
+            if (existing.settings == atmo && !existing.handle.Expired()) { duplicate = true; break; }
         }
         if (duplicate) continue;
 
         AtmosphereEntry entry;
-        entry.token    = aToken;
-        entry.keepAlive = params[i];
+        entry.handle   = params[i];
         entry.settings = atmo;
         entry.baseMoonGlowIntensity = SaveFloatCurve(atmo->moonGlowIntensity);
         entry.baseMoonColor         = SaveHDRCurve(atmo->moonColor);
@@ -247,12 +254,11 @@ static void ScanAreaSettingsLocked(
 
             bool duplicate = false;
             for (const auto& existing : s_lightEntries)
-                if (existing.settings == light) { duplicate = true; break; }
+                if (existing.settings == light && !existing.handle.Expired()) { duplicate = true; break; }
             if (duplicate) continue;
 
             LightEntry le;
-            le.token         = aToken;
-            le.keepAlive     = params[i];
+            le.handle        = params[i];
             le.settings      = light;
             le.baseMoonColor = SaveHDRCurve(light->moonColor);
 
@@ -308,35 +314,28 @@ void TryRegisterToken(RED4ext::SharedPtr<RED4ext::ResourceToken<>> aToken)
     if (!s_atmosphereClass && !s_lightClass) return;
 
     auto* type = resource->GetType();
+    if (type != s_envParamClass && type != s_envDefinitionClass && type != s_sectorClass)
+        return;
+
+    // Cached resources come back through the hook on every request; only scan each one once.
+    if (!s_scannedResources.insert(resource->unk28).second)
+        return;
+
+    // A newly loaded resource usually means others streamed out; forget their entries.
+    ReapDeadEntriesLocked();
 
     if (type == s_envParamClass)
     {
-        // Skip if we've already processed this resource.
-        for (const auto& e : s_entries)
-        {
-            if (e.token.instance && e.token.instance->resource.instance == resource)
-                return;
-        }
         auto* env = static_cast<RED4ext::world::EnvironmentAreaParameters*>(resource);
-        ScanAreaSettingsLocked(aToken, env->renderAreaSettings, s_atmosphereClass, s_lightClass, "envparam");
+        ScanAreaSettingsLocked(env->renderAreaSettings, s_atmosphereClass, s_lightClass, "envparam");
     }
     else if (type == s_envDefinitionClass)
     {
-        // Skip if we've already processed this resource.
-        for (const auto& e : s_entries)
-        {
-            if (e.token.instance && e.token.instance->resource.instance == resource)
-                return;
-        }
         auto* def = static_cast<RED4ext::world::EnvironmentDefinition*>(resource);
-        ScanAreaSettingsLocked(aToken, def->worldRenderSettings, s_atmosphereClass, s_lightClass, "envdef");
+        ScanAreaSettingsLocked(def->worldRenderSettings, s_atmosphereClass, s_lightClass, "envdef");
     }
-    else if (type == s_sectorClass)
+    else // s_sectorClass
     {
-        // Cached sectors come back through the hook on every request; only walk each one once.
-        if (!s_scannedSectors.insert(resource->unk28).second)
-            return;
-
         // worldStreamingSector nodes are accessed via worldCompiledSector at
         // offset 0x40 (Codeware: worldStreamingSector::compiled).
         // nodes: DynArray<Handle<worldNode>> sits at +0x30 within it (+0x28 before patch 2.5).
@@ -363,7 +362,7 @@ void TryRegisterToken(RED4ext::SharedPtr<RED4ext::ResourceToken<>> aToken)
                 if (notifierType != s_envNotifierClass) continue;
 
                 auto* envNotifier = static_cast<RED4ext::world::EnvAreaNotifier*>(notifier);
-                ScanAreaSettingsLocked(aToken, envNotifier->params, s_atmosphereClass, s_lightClass, "sector");
+                ScanAreaSettingsLocked(envNotifier->params, s_atmosphereClass, s_lightClass, "sector");
             }
         }
 
@@ -397,9 +396,13 @@ void ApplyPhase(int32_t aPhase)
                                    s_lastApplied->starScale != starScale || s_lastApplied->lightScale != lightScale;
     s_lastApplied = values;
 
+    ReapDeadEntriesLocked();
+
     for (auto& entry : s_entries)
     {
-        if (!entry.settings) continue;
+        // Holding the locked handle keeps the settings alive while the curves are written.
+        const auto alive = entry.handle.Lock();
+        if (!alive.instance || !entry.settings) continue;
         if (!entry.baseMoonGlowIntensity.times.empty())
             ApplyFloatCurve(entry.settings->moonGlowIntensity, entry.baseMoonGlowIntensity, scale);
         if (!entry.baseMoonColor.times.empty())
@@ -411,7 +414,8 @@ void ApplyPhase(int32_t aPhase)
     }
     for (auto& le : s_lightEntries)
     {
-        if (!le.settings) continue;
+        const auto alive = le.handle.Lock();
+        if (!alive.instance || !le.settings) continue;
         if (!le.baseMoonColor.times.empty())
             ApplyHDRCurve(le.settings->moonColor, le.baseMoonColor, lightScale);
     }
@@ -464,7 +468,7 @@ void ReleaseAll()
 {
     std::lock_guard<std::mutex> lock(s_mutex);
     s_entries.clear();
-    s_scannedSectors.clear();
+    s_scannedResources.clear();
     s_envParamClass      = nullptr;
     s_envDefinitionClass = nullptr;
     s_sectorClass        = nullptr;
