@@ -59,8 +59,7 @@ static uintptr_t Hook_IssueLoadingRequest(
     if (aRequest.path == g_moonPath)
     {
         const int32_t phase = g_currentPhase.load(std::memory_order_relaxed);
-        RED4ext::ResourceRequest redirected = aRequest;
-        redirected.path = RED4ext::ResourcePath(kPhasePaths[phase]);
+        RED4ext::ResourceRequest redirected{RED4ext::ResourcePath(kPhasePaths[phase])};
         auto result = s_originalLoadByRequest(aThis, aOut, redirected);
 
         if (aOut.instance)
